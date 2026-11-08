@@ -1,0 +1,22 @@
+{
+  "name": "moas-agency",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "start": "node backend/server.js",
+    "check": "node --check server.js && node --check backend/server.js && node --check public/script.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "mongodb": "^6.15.0",
+    "dotenv": "^16.4.7",
+    "helmet": "^8.0.0",
+    "cookie-parser": "^1.4.7",
+    "jsonwebtoken": "^9.0.2",
+    "express-rate-limit": "^8.2.2"
+  }
+}

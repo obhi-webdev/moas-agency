@@ -484,189 +484,192 @@ function cap(name) {
   return capCache[name];
 }
 
+
+// MOAS MONGODB FRONTEND V1
 const Store = {
   db: null,
   writing: {},
+
+  async request(url, options = {}) {
+    const response = await fetch(url, {
+      ...options,
+      credentials: "same-origin",
+      headers: {
+        "Content-Type": "application/json",
+        ...(options.headers || {})
+      }
+    });
+
+    if (!response.ok) {
+      const error = new Error(
+        "Server request failed: " + response.status
+      );
+      error.code = String(response.status);
+      throw error;
+    }
+
+    return response.json();
+  },
+
   async init() {
-    let db = null,
-      user = null;
-    if (window.claude && typeof window.claude.use === "function") {
-      [db, user] = await Promise.all([cap("db"), cap("user")]);
-    }
-    if (user) {
-      try {
-        ME.owner = await user.isOwner();
-      } catch {
-        ME.owner = false;
-      }
-      try {
-        ME.manager = ME.owner || (await user.canEdit());
-      } catch {
-        ME.manager = false;
-      }
-      try {
-        const c = await user.can("data.write");
-        ME.canWrite = c !== false;
-      } catch {}
-      try {
-        ME.uid = await user.id();
-      } catch {}
-    }
-    if (db) {
-      this.db = db;
-      ME.mode = "db";
-      this.subscribe();
-    } else {
+    const session = await fetch("/api/auth/me", {
+      credentials: "same-origin"
+    });
+
+    if (!session.ok) {
+      AUTHED = false;
       ME.mode = "local";
-      this.loadLocal();
+      ME.canWrite = false;
       loaded();
+      setSync();
+      render();
+      return;
     }
+
+    AUTHED = true;
+
+    const data = await this.request("/api/state");
+
+    for (const col of COLS) {
+      if (!Array.isArray(data[col])) {
+        throw new Error("Missing database module: " + col);
+      }
+    }
+
+    COLS.forEach(col => {
+      S[col] = data[col];
+    });
+
+    S.cfg = mergeCfg(data.cfg || {});
+
+    ME.mode = "db";
+    ME.manager = true;
+    ME.owner = true;
+    ME.canWrite = true;
+    ME.uid = "admin";
+
+    loaded();
     setSync();
+    schedule();
+    render();
+
+    console.log("[MOAS] MongoDB data loaded");
   },
-  subscribe() {
-    const pending = new Set([...COLS, "cfg"]);
-    let first = new Set([...COLS, "cfg"]);
-    const timer = setTimeout(() => {
-      loaded();
-      if (pending.size)
-        banner(
-          "ডেটা সার্ভার থেকে আসতে দেরি হচ্ছে — দেখানো তথ্য পুরনো হতে পারে। ইন্টারনেট সংযোগ দেখুন।",
-        );
-    }, 10000);
-    const got = (k, snap) => {
-      first.delete(k);
-      if (!first.size) loaded();
-      if (!snap.metadata.fromCache) {
-        pending.delete(k);
-        if (!pending.size) {
-          clearTimeout(timer);
-          banner("");
-        }
-      }
-    };
-    const fail = (k, e) => {
-      pending.delete(k);
-      first.delete(k);
-      if (!first.size) loaded();
-      if (e && e.code === "revoked") {
-        ME.canWrite = false;
-        banner("এই পেজে ডেটা অ্যাক্সেস আর নেই।");
-      } else
-        banner(
-          "ডেটা লোড করা যায়নি (" +
-            esc(e?.code || "error") +
-            ")। পেজটি আবার খুলুন।",
-        );
-    };
-    COLS.forEach((c) =>
-      this.db.collection(c).onSnapshot(
-        (snap) => {
-          S[c] = snap.docs.map((d) => ({ ...d.data(), id: d.id }));
-          got(c, snap);
-          schedule();
-        },
-        (e) => fail(c, e),
-      ),
-    );
-    this.db.doc("config/main").onSnapshot(
-      (snap) => {
-        S.cfg = mergeCfg(snap.exists ? snap.data() : {});
-        got("cfg", snap);
-        schedule();
-      },
-      (e) => fail("cfg", e),
-    );
-  },
-  loadLocal() {
-    try {
-      const d = JSON.parse(localStorage.getItem("moas-expense-v1") || "null");
-      if (d) {
-        COLS.forEach((c) => (S[c] = d[c] || []));
-        S.cfg = mergeCfg(d.cfg);
-      }
-    } catch {}
-  },
-  persist() {
-    if (ME.mode !== "local") return;
-    try {
-      const o = { cfg: S.cfg };
-      COLS.forEach((c) => (o[c] = S[c]));
-      localStorage.setItem("moas-expense-v1", JSON.stringify(o));
-    } catch {
-      toast("ব্রাউজারে জায়গা শেষ — ব্যাকআপ নিয়ে পুরনো ডেটা মুছুন", "err");
-    }
-  },
+
   async write(path, fn) {
     while (this.writing[path]) {
       try {
         await this.writing[path];
       } catch {}
     }
-    const p = (async () => {
-      for (let t = 0; ; t++) {
-        try {
-          return await fn();
-        } catch (e) {
-          if (
-            (e?.code === "unavailable" || e?.code === "resource_exhausted") &&
-            t < 3
-          ) {
-            await sleep(500 + Math.random() * 900 * (t + 1));
-            continue;
-          }
-          throw e;
-        }
-      }
-    })();
-    this.writing[path] = p;
+
+    const pending = Promise.resolve().then(fn);
+    this.writing[path] = pending;
+
     try {
-      return await p;
-    } catch (e) {
-      writeErr(e);
-      throw e;
+      return await pending;
+    } catch (error) {
+      writeErr(error);
+      throw error;
     } finally {
-      if (this.writing[path] === p) delete this.writing[path];
+      if (this.writing[path] === pending) {
+        delete this.writing[path];
+      }
     }
   },
+
   async save(col, obj, { silent } = {}) {
+    if (!AUTHED || ME.mode !== "db") {
+      throw new Error("Database session not ready");
+    }
+
+    if (!COLS.includes(col)) {
+      throw new Error("Invalid module: " + col);
+    }
+
     obj = clone(obj);
+
     if (!obj.id) obj.id = newId();
-    if (col === "expenses" && !obj.vno) obj.vno = nextVno();
+
+    if (col === "expenses" && !obj.vno) {
+      obj.vno = nextVno();
+    }
+
     obj.updatedAt = Date.now();
-    if (!obj.createdAt) obj.createdAt = Date.now();
-    if (ME.uid && !obj.createdBy) obj.createdBy = ME.uid;
+
+    if (!obj.createdAt) {
+      obj.createdAt = Date.now();
+    }
+
+    if (!obj.createdBy) {
+      obj.createdBy = ME.uid;
+    }
+
+    await this.write(col + "/" + obj.id, () =>
+      this.request(
+        "/api/state/" +
+        encodeURIComponent(col) + "/" +
+        encodeURIComponent(obj.id),
+        {
+          method: "PUT",
+          body: JSON.stringify(obj)
+        }
+      )
+    );
+
     const arr = S[col];
-    const i = arr.findIndex((x) => x.id === obj.id);
-    if (i >= 0) arr[i] = obj;
+    const index = arr.findIndex(x => x.id === obj.id);
+
+    if (index >= 0) arr[index] = obj;
     else arr.push(obj);
+
     if (!silent) schedule();
-    if (this.db) {
-      const { id, ...body } = obj;
-      await this.write(col + "/" + id, () =>
-        this.db.doc(col + "/" + id).set(body),
-      );
-    } else this.persist();
+
     return obj;
   },
+
   async del(col, id, { silent } = {}) {
-    S[col] = S[col].filter((x) => x.id !== id);
+    if (!AUTHED || ME.mode !== "db") {
+      throw new Error("Database session not ready");
+    }
+
+    if (!COLS.includes(col)) {
+      throw new Error("Invalid module");
+    }
+
+    await this.write(col + "/" + id, () =>
+      this.request(
+        "/api/state/" +
+        encodeURIComponent(col) + "/" +
+        encodeURIComponent(id),
+        { method: "DELETE" }
+      )
+    );
+
+    S[col] = S[col].filter(x => x.id !== id);
+
     if (!silent) schedule();
-    if (this.db)
-      await this.write(col + "/" + id, () =>
-        this.db.doc(col + "/" + id).delete(),
-      );
-    else this.persist();
   },
-  async saveCfg(c) {
-    S.cfg = mergeCfg(c);
+
+  async saveCfg(config) {
+    if (!AUTHED || ME.mode !== "db") {
+      throw new Error("Database session not ready");
+    }
+
+    const merged = mergeCfg(config);
+
+    await this.write("config/main", () =>
+      this.request("/api/state/config", {
+        method: "PUT",
+        body: JSON.stringify(merged)
+      })
+    );
+
+    S.cfg = merged;
     schedule();
-    if (this.db)
-      await this.write("config/main", () =>
-        this.db.doc("config/main").set(clone(S.cfg)),
-      );
-    else this.persist();
-  },
+  }
 };
+
 function writeErr(e) {
   const c = e?.code;
   if (c === "invalid_argument") {
@@ -8908,43 +8911,42 @@ async function pbkdf2(pass, saltHex, iter) {
     ),
   );
 }
+
+// MOAS SERVER AUTH V1
 function authTokenValid() {
+  return AUTHED === true;
+}
+
+function authSave() {
+  // Server maintains the HttpOnly session cookie.
+}
+
+async function logout() {
   try {
-    const t = JSON.parse(
-      localStorage.getItem("moas-auth") ||
-        sessionStorage.getItem("moas-auth") ||
-        "null",
-    );
-    const a = authCfg();
-    return !!(t && t.k === a.hash.slice(0, 24) && t.exp > Date.now());
-  } catch {
-    return false;
+    await fetch("/api/auth/logout", {
+      method: "POST",
+      credentials: "same-origin"
+    });
+  } catch (error) {
+    console.warn("Logout request failed", error);
   }
-}
-function authSave(remember) {
-  const t = JSON.stringify({
-    k: authCfg().hash.slice(0, 24),
-    exp: Date.now() + (remember ? 30 : 1) * 864e5,
-  });
-  try {
-    if (remember) localStorage.setItem("moas-auth", t);
-    else {
-      localStorage.removeItem("moas-auth");
-      sessionStorage.setItem("moas-auth", t);
-    }
-  } catch {}
-}
-function logout() {
+
+  AUTHED = false;
+
   try {
     localStorage.removeItem("moas-auth");
     sessionStorage.removeItem("moas-auth");
   } catch {}
-  AUTHED = false;
+
   closeModal();
   closeAi();
-  $("#bellPanel").classList.remove("open");
+
+  const panel = $("#bellPanel");
+  if (panel) panel.classList.remove("open");
+
   render();
 }
+
 let gateFails = 0,
   gateLockUntil = 0;
 function gateShow() {
@@ -8968,74 +8970,83 @@ function gateShow() {
     }, 60);
   }
 }
+
 async function gateTry() {
-  const err = $("#gErr"),
-    btn = $("#gGo");
+  const err = $("#gErr");
+  const btn = $("#gGo");
+
   if (Date.now() < gateLockUntil) {
-    err.textContent = tr("অনেকবার ভুল হয়েছে — কিছুক্ষণ পর আবার চেষ্টা করুন");
+    err.textContent = "Too many attempts. Try again later.";
     return;
   }
-  const email = $("#gEmail").value.trim().toLowerCase(),
-    pass = $("#gPass").value;
-  if (!email || !pass) {
-    err.textContent = tr("ইমেইল ও পাসওয়ার্ড দুটোই লিখুন");
+
+  const email = $("#gEmail").value.trim().toLowerCase();
+  const password = $("#gPass").value;
+
+  if (!email || !password) {
+    err.textContent = "Enter email and password.";
     return;
   }
+
   btn.disabled = true;
-  btn.textContent = tr("যাচাই হচ্ছে…");
+  btn.textContent = "Logging in...";
   err.textContent = "";
+
   try {
-    const a = authCfg();
-    const h = await pbkdf2(pass, a.salt, a.iter);
-    if (email === String(a.email).toLowerCase() && h === a.hash) {
-      gateFails = 0;
-      authSave($("#gRemember").checked);
-      AUTHED = true;
-      $("#gPass").value = "";
-      $("#gate").classList.remove("on");
-      render();
-      setTimeout(remDailyNotice, 1500);
-    } else {
+    // MOAS LOGIN DIAGNOSTIC V1
+
+    const response = await fetch("/api/auth/login", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ email, password })
+    });
+
+
+    if (!response.ok) {
       gateFails++;
+
       if (gateFails >= 5) {
         gateLockUntil = Date.now() + 30000;
         gateFails = 0;
       }
-      err.textContent = tr("ইমেইল বা পাসওয়ার্ড সঠিক নয়");
-      $("#gPass").select();
+
+      err.textContent =
+        response.status === 401
+          ? "Invalid email or password."
+          : "Login failed. Please try again.";
+      return;
     }
-  } catch (e) {
-    err.textContent = tr("এই ব্রাউজারে লগইন যাচাই করা যাচ্ছে না");
+
+    gateFails = 0;
+    AUTHED = true;
+    await Store.init();
+
+    $("#gPass").value = "";
+    $("#gate").classList.remove("on");
+
+    render();
+    setTimeout(remDailyNotice, 1500);
+
+  } catch (error) {
+    console.error("Login failed:", error);
+    err.textContent = "Cannot connect to backend server.";
   } finally {
     btn.disabled = false;
-    btn.textContent = tr("লগইন");
+    btn.textContent = "Login";
   }
 }
+
+
 async function changePw() {
-  const o = $("#pwOld").value,
-    em = $("#pwEmail").value.trim().toLowerCase(),
-    n = $("#pwNew").value,
-    n2 = $("#pwNew2").value,
-    a = authCfg();
-  if (!o) return toast("বর্তমান পাসওয়ার্ড লিখুন", "err");
-  if ((await pbkdf2(o, a.salt, a.iter)) !== a.hash)
-    return toast("বর্তমান পাসওয়ার্ড সঠিক নয়", "err");
-  if (!/^\S+@\S+\.\S+$/.test(em)) return toast("সঠিক ইমেইল লিখুন", "err");
-  if (n.length < 8)
-    return toast("নতুন পাসওয়ার্ড অন্তত ৮ অক্ষরের হতে হবে", "err");
-  if (n !== n2) return toast("দুটি নতুন পাসওয়ার্ড মেলেনি", "err");
-  const salt = hex(crypto.getRandomValues(new Uint8Array(16)));
-  const hash = await pbkdf2(n, salt, 200000);
-  try {
-    await Store.saveCfg({
-      ...S.cfg,
-      auth: { email: em, salt, hash, iter: 200000 },
-    });
-    authSave(true);
-    toast("লগইন তথ্য বদলানো হয়েছে");
-    render();
-  } catch {}
+  toast(
+    "Password changes must be configured on the server.",
+    "err"
+  );
 }
+
 $("#gGo").addEventListener("click", gateTry);
 ["gEmail", "gPass"].forEach((id) =>
   $("#" + id).addEventListener("keydown", (e) => {
@@ -9050,7 +9061,24 @@ $("#gEye").addEventListener("click", () => {
   p.type = p.type === "password" ? "text" : "password";
 });
 $("#logoutBtn").addEventListener("click", logout);
-AUTHED = authTokenValid();
+
+AUTHED = false;
+
+fetch("/api/auth/me", {
+  credentials: "same-origin"
+})
+.then(async response => {
+  if (response.ok) {
+    await Store.init();
+  }
+})
+.catch(error => {
+  console.warn("Session restore failed:", error.message);
+  AUTHED = false;
+  render();
+});
+
+
 
 let rotI = 0;
 setInterval(() => {
